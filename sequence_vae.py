@@ -1,8 +1,11 @@
 import tensorflow as tf
 import numpy as np
+from tensorflow.contrib.framework.python.framework import checkpoint_utils
 
 
 class SequenceVae:
+    checkpoint_path = "D://sensor_data_generation//models//vae_model.ckpt"
+
     def __init__(self, dataset,
                  history_conv_encoder_feature_counts,
                  history_encoder_kernel_width,
@@ -58,6 +61,7 @@ class SequenceVae:
         self.z_ = None
         self.xMeans_ = []
         self.xMeanInference = None
+        self.xStds = []
         self.zPrior = None
         self.q_z_given_x = None
         self.encoderKLDivergence = None
@@ -67,6 +71,7 @@ class SequenceVae:
         self.expectedDecoderLogProb = None
         self.totalVaeLoss = None
         self.globalStep = tf.Variable(0, name='global_step', trainable=False)
+        self.updateOps = None
         self.optimizer = None
         # self.prob_p_x_given_z_list_1 = []
         # self.prob_p_x_given_z_list_2 = []
@@ -212,10 +217,9 @@ class SequenceVae:
                 kernel_size=[2, 1],
                 strides=[2, 1],
                 name="x_mean_generator_up_sample")
-            x_means = self.convert_to_matrix(tensor_=net)
-            return x_means
+            return net
 
-    def build_decoder(self, z_input, sample_count, is_inference):
+    def build_decoder(self, is_inference):
         with tf.variable_scope("Decoder", reuse=tf.AUTO_REUSE):
             self.historyEncoderInput = self.build_convolutional_blocks(
                 entry_input=self.historySequences,
@@ -242,20 +246,28 @@ class SequenceVae:
             if not is_inference:
                 # Decode: p(x|z,history) such that z ~ q(z|x,history)
                 self.xMeans_ = []
-                for z_id in range(sample_count):
-                    z_ = tf.expand_dims(z_input[..., z_id], axis=-1)
+                self.xStds = []
+                for z_id in range(self.zSampleCount):
+                    z_ = tf.expand_dims(self.z_[..., z_id], axis=-1)
                     x_means = self.get_decoder_output(z_=z_)
-                    self.xMeans_.append(x_means)
+                    x_means = self.convert_to_matrix(tensor_=x_means)
+                    x_stds = tf.constant(self.decoderStd[np.newaxis, :])
+                    x_stds = tf.tile(x_stds, [tf.shape(x_means)[0], 1])
+                    self.xStds.append(x_stds)
+                    # p_x_given_z = tf.contrib.distributions.MultivariateNormalDiag(
+                    #     loc=x_means,
+                    #     scale_diag=self.decoderStd * tf.ones_like(x_means))
                     p_x_given_z = tf.contrib.distributions.MultivariateNormalDiag(
                         loc=x_means,
-                        scale_diag=self.decoderStd * tf.ones_like(x_means))
+                        scale_diag=x_stds)
                     self.p_x_given_z_list.append(p_x_given_z)
                     X_ = self.convert_to_matrix(tensor_=self.currentSequences)
                     self.logProb_p_x_given_z_list.append(p_x_given_z.log_prob(value=X_))
                 self.expectedDecoderLogProb = tf.reduce_mean(tf.stack(self.logProb_p_x_given_z_list, axis=1))
             else:
                 # Sample: z ~ N(z|0,I) and generate
-                z_shape = tf.concat([[1], tf.shape(self.currentSequences)[1:2], [1]], axis=0)
+                width_height = self.encoderMeans.get_shape().as_list()[1:3]
+                z_shape = tf.concat([[1], width_height, [1]], axis=0)
                 z_normal = tf.random_normal(shape=z_shape, mean=0.0, stddev=1.0)
                 self.xMeanInference = self.get_decoder_output(z_=z_normal)
 
@@ -265,12 +277,15 @@ class SequenceVae:
         # ****** Encoder: q(z|x) ******
 
         # ****** Decoder: p(x|z) ******
-        self.build_decoder(z_input=self.z_, sample_count=self.zSampleCount, is_inference=False)
+        self.build_decoder(is_inference=False)
+        self.build_decoder(is_inference=True)
         # ****** Decoder: p(x|z) ******
 
         # ****** Total Vae Loss ******
         self.totalVaeLoss = self.expectedEncoderKLDivergence - self.expectedDecoderLogProb
-        self.optimizer = tf.train.AdamOptimizer().minimize(self.totalVaeLoss, global_step=self.globalStep)
+        self.updateOps = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+        with tf.control_dependencies(self.updateOps):
+            self.optimizer = tf.train.AdamOptimizer().minimize(self.totalVaeLoss, global_step=self.globalStep)
         # ****** Total Vae Loss ******
 
     def convert_to_matrix(self, tensor_):
@@ -280,7 +295,19 @@ class SequenceVae:
         mt = tf.reshape(mt, shape=(m_shape[0] * m_shape[1], m_shape[2]))
         return mt
 
-    def train(self, batch_size, max_iterations=2500, report_period=25000):
+    def load_model(self, sess):
+        saved_vars = checkpoint_utils.list_variables(
+            checkpoint_dir="D:\\sensor_data_generation\\models\\vae_model.ckpt")
+        all_vars = tf.global_variables()
+        for var in all_vars:
+            if "Adam" in var.name:
+                continue
+            source_array = checkpoint_utils.load_variable(
+                checkpoint_dir="D:\\sensor_data_generation\\models\\vae_model.ckpt", name=var.name)
+            tf.assign(var, source_array).eval(session=sess)
+        print("X")
+
+    def train(self, batch_size, max_iterations=3000, report_period=25000):
         # Initialize
         sess = tf.Session()
         saver = tf.train.Saver(max_to_keep=1000000)
@@ -289,7 +316,8 @@ class SequenceVae:
         for iteration_id in range(max_iterations):
             history_tensor, sequence_tensor = self.dataset.get_minibatch(batch_size=batch_size)
             feed_dict = {self.currentSequences: np.expand_dims(sequence_tensor, axis=-1),
-                         self.historySequences: np.expand_dims(history_tensor, axis=-1)}
+                         self.historySequences: np.expand_dims(history_tensor, axis=-1),
+                         self.isTraining: True}
             run_ops = [self.optimizer, self.totalVaeLoss]
             results = sess.run(run_ops, feed_dict=feed_dict)
             losses.append(results[1])
@@ -297,36 +325,27 @@ class SequenceVae:
                 avg_loss = np.mean(np.array(losses))
                 losses = []
                 print("Iteration:{0} Avg Loss:{1}".format(iteration_id, avg_loss))
-        saver.save(sess, "D://sensor_data_generation//models//vae_model.ckpt")
+        saver.save(sess, SequenceVae.checkpoint_path)
 
-        # # run_ops = [self.encoderParameters,
-        # #            self.encoderParamsBeforePooling,
-        # #            self.encoderMeans,
-        # #            self.encoderVariances,
-        # #            self.encoderMeansConcat,
-        # #            self.encoderVariancesConcat,
-        # #            self.eps,
-        # #            self.z_,
-        # #            [tf.expand_dims(self.z_[..., z_id], axis=-1) for z_id in range(self.zSampleCount)],
-        # #            self.xMeans_,
-        # #            self.zPrior.mean(),
-        # #            self.q_z_given_x.mean(),
-        # #            self.encoderKLDivergence,
-        # #            self.expectedEncoderKLDivergence,
-        # #            self.decoderLogProb_1,
-        # #            self.decoderLogProb_2,
-        # #            self.expectedDecoderLogProb_1,
-        # #            self.expectedDecoderLogProb_2,
-        # #            self.grad_1,
-        # #            self.grad_2]
-        # # results = sess.run(run_ops, feed_dict=feed_dict)
-        # # assert np.array_equal(results[0], np.stack(results[1:], axis=-1))
-        # # assert np.allclose(results[1] + np.sqrt(results[2]) * results[3], results[4])
-        # # assert all([np.array_equal(results[1][i, :, j, 0], results[3][i * 500 + j, :]) for i in range(128) for j in
-        # #             range(500)])
-        # # assert all([np.array_equal(results[2][i, :, j, 0], results[4][i * 500 + j, :]) for i in range(128) for j in
-        # #             range(500)])
-        # print("X")
+    def sample_sequence(self, sess, history_sequence, number_of_frames, std_scale=0.1):
+        generated_sequences = []
+        cov_matrix = std_scale * np.diag(np.square(self.dataset.stdArr))
+        curr_history = history_sequence if history_sequence is not None else \
+            np.zeros_like(self.dataset.trainingSamples[0]["history_image"])
+        for frame_id in range(number_of_frames):
+            feed_dict = {self.historySequences: np.expand_dims(curr_history, axis=-1),
+                         self.isTraining: False}
+            results = sess.run([self.xMeanInference], feed_dict=feed_dict)
+            means = np.squeeze(results[0])
+            samples = []
+            for i in range(means.shape[1]):
+                mu = means[:, i]
+                samples.append(np.random.multivariate_normal(mu, cov_matrix))
+            sampled_signal = np.stack(samples, axis=1)
+            curr_history = sampled_signal[np.newaxis, ...]
+            generated_sequences.append(sampled_signal)
+        total_signal = np.concatenate(generated_sequences, axis=1)
+        return total_signal
 
     def kl_divergence_of_diagonal_gaussians(self, mu_p, sigma_p, mu_q, sigma_q):
         s_p = np.square(sigma_p)
